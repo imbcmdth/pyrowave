@@ -27,9 +27,11 @@ struct DWTRegisters
 	float inv_resolution[2];
 	int32_t aligned_resolution[2];
 	uint32_t store_fp16;
-	uint32_t padding;
+	int32_t input_layer;
+	int32_t output_layer;
+	uint32_t padding[3];
 };
-static_assert(sizeof(DWTRegisters) == 32, "Must match Registers in the WGSL.");
+static_assert(sizeof(DWTRegisters) == 48, "Must match Registers in the WGSL.");
 
 struct QuantizerRegisters
 {
@@ -187,7 +189,7 @@ struct InputDispatch
 {
 	size_t dispatch_index;
 	int plane;
-	uint32_t slot;
+	DispatchTable::Range registers;
 	int dc_shift;
 	WGPUTextureView output;
 };
@@ -214,10 +216,13 @@ struct pyrowave_webgpu_encoder_opaque
 	uint64_t bitstream_size = 0;
 	uint64_t meta_size = 0;
 
+	// Only resolve has its own uniform block; the other stages keep theirs in tables.
 	WGPUBuffer uniform_buffer = nullptr;
 	std::vector<uint8_t> uniform_data;
+	DispatchTable dwt_table;
 
-	// Input planes for the CPU entry point.
+	// Input planes for the CPU entry point, with one layer array views, which is what
+	// the DWT samples.
 	WGPUTexture input_textures[3] = {};
 	WGPUTextureView input_views[3] = {};
 	std::vector<uint8_t> deinterleave_scratch[2];
@@ -243,7 +248,7 @@ struct pyrowave_webgpu_encoder_opaque
 	bool init(pyrowave_webgpu_device device, int width, int height, ChromaSubsampling chroma);
 	void release();
 
-	bool plan_dwt(uint32_t &slot);
+	bool plan_dwt();
 	bool plan_quant_analyze();
 	bool plan_resolve(uint32_t &slot);
 	bool plan_packing();
@@ -254,9 +259,24 @@ struct pyrowave_webgpu_encoder_opaque
 	int plane_height(int plane) const;
 
 	pyrowave_webgpu_result prepare_frame(const pyrowave_webgpu_rate_control *rate_control);
-	pyrowave_webgpu_result submit_frame(const WGPUTextureView *planes);
+	pyrowave_webgpu_result submit_frame(const WGPUTexture *planes);
 	bool wait_result();
 };
+
+// The DWT samples an array texture, so the planes are bound as one layer arrays.
+static WGPUTextureView create_plane_view(WGPUTexture texture)
+{
+	if (!texture)
+		return nullptr;
+	WGPUTextureViewDescriptor desc = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
+	desc.dimension = WGPUTextureViewDimension_2DArray;
+	desc.baseMipLevel = 0;
+	desc.mipLevelCount = 1;
+	desc.baseArrayLayer = 0;
+	desc.arrayLayerCount = 1;
+	desc.aspect = WGPUTextureAspect_All;
+	return wgpuTextureCreateView(texture, &desc);
+}
 
 int pyrowave_webgpu_encoder_opaque::plane_width(int plane) const
 {
@@ -271,7 +291,7 @@ int pyrowave_webgpu_encoder_opaque::plane_height(int plane) const
 WGPUBindGroup pyrowave_webgpu_encoder_opaque::create_input_group(const InputDispatch &input, WGPUTextureView plane)
 {
 	const BindingResource resources[] = {
-		bind_buffer(0, uniform_buffer, uint64_t(input.slot) * UniformSlotSize, sizeof(DWTRegisters)),
+		dwt_table.bind(0, input.registers),
 		bind_view(1, plane),
 		bind_sampler(2, device->mirror_repeat_sampler),
 		bind_view(3, input.output),
@@ -279,44 +299,20 @@ WGPUBindGroup pyrowave_webgpu_encoder_opaque::create_input_group(const InputDisp
 	return create_bind_group(device, device->dwt[input.dc_shift], resources, 4);
 }
 
-bool pyrowave_webgpu_encoder_opaque::plan_dwt(uint32_t &slot)
+bool pyrowave_webgpu_encoder_opaque::plan_dwt()
 {
-	// Mirrors Encoder::Impl::dwt().
-	auto &dispatches = stages[STAGE_DWT];
-	const bool is_420 = layout.chroma == ChromaSubsampling::Chroma420;
-
-	const auto add = [&](int output_level, int component, const DWTRegisters &regs, int dc_shift,
-	                     int input_plane, WGPUTextureView input_ll) -> bool
+	// Mirrors Encoder::Impl::dwt(). The components of a level that read from the
+	// pyramid share one dispatch, one per workgroup_id.z; the ones that read an input
+	// plane get a dispatch each, since every plane is its own texture.
+	struct Spec
 	{
-		write_uniform(uniform_data, slot, regs);
-		WGPUTextureView output = pyramid.component_layer_views[component][output_level];
-		Dispatch d = {};
-		d.pipeline = device->dwt[dc_shift].pipeline;
-		d.x = uint32_t(regs.aligned_resolution[0] + 31) / 32;
-		d.y = uint32_t(regs.aligned_resolution[1] + 31) / 32;
-		d.z = 1;
-
-		if (input_plane >= 0)
-		{
-			input_dispatches.push_back({ dispatches.size(), input_plane, slot, dc_shift, output });
-		}
-		else
-		{
-			const BindingResource resources[] = {
-				bind_buffer(0, uniform_buffer, uint64_t(slot) * UniformSlotSize, sizeof(DWTRegisters)),
-				bind_view(1, input_ll),
-				bind_sampler(2, device->mirror_repeat_sampler),
-				bind_view(3, output),
-			};
-			d.bind_group = create_bind_group(device, device->dwt[dc_shift], resources, 4);
-			if (!d.bind_group)
-				return false;
-		}
-
-		dispatches.push_back(d);
-		slot++;
-		return true;
+		int level;
+		int plane;
+		std::vector<DWTRegisters> regs;
+		DispatchTable::Range range;
 	};
+	std::vector<Spec> specs;
+	const bool is_420 = layout.chroma == ChromaSubsampling::Chroma420;
 
 	for (int output_level = 0; output_level < DecompositionLevels; output_level++)
 	{
@@ -341,37 +337,80 @@ bool pyrowave_webgpu_encoder_opaque::plan_dwt(uint32_t &slot)
 		regs.inv_resolution[0] = 1.0f / float(regs.resolution[0]);
 		regs.inv_resolution[1] = 1.0f / float(regs.resolution[1]);
 
-		if (output_level == 0)
+		Spec from_pyramid = { output_level, -1, {}, {} };
+
+		for (int c = 0; c < NumComponents; c++)
 		{
-			int components = is_420 ? 1 : NumComponents;
-			for (int c = 0; c < components; c++)
-				if (!add(output_level, c, regs, 1, c, nullptr))
-					return false;
+			// Under 420 chroma enters the pyramid at level 1.
+			if (output_level == 0 && is_420 && c != 0)
+				continue;
+
+			DWTRegisters component = regs;
+			component.output_layer = NumFrequencyBandsPerLevel * c;
+
+			if (output_level == 0 || (is_420 && c != 0 && output_level == 1))
+			{
+				if (output_level == 1)
+				{
+					component.resolution[0] = plane_width(c);
+					component.resolution[1] = plane_height(c);
+					component.aligned_resolution[0] = layout.aligned_width >> output_level;
+					component.aligned_resolution[1] = layout.aligned_height >> output_level;
+					component.inv_resolution[0] = 1.0f / float(component.resolution[0]);
+					component.inv_resolution[1] = 1.0f / float(component.resolution[1]);
+				}
+				component.input_layer = 0;
+				specs.push_back({ output_level, c, { component }, {} });
+			}
+			else
+			{
+				// The LL band of the previous level.
+				component.input_layer = NumFrequencyBandsPerLevel * c;
+				from_pyramid.regs.push_back(component);
+			}
+		}
+
+		if (!from_pyramid.regs.empty())
+			specs.push_back(from_pyramid);
+	}
+
+	for (auto &spec : specs)
+		spec.range = dwt_table.add(spec.regs.data(), uint32_t(spec.regs.size()));
+	if (!dwt_table.create(device, "dwt-registers"))
+		return false;
+
+	auto &dispatches = stages[STAGE_DWT];
+	for (auto &spec : specs)
+	{
+		// DCShift converts the unorm input planes to the signed range, so it applies
+		// exactly when the source is an input plane.
+		int dc_shift = spec.plane >= 0 ? 1 : 0;
+		WGPUTextureView output = pyramid.level_views[spec.level];
+
+		Dispatch d = {};
+		d.pipeline = device->dwt[dc_shift].pipeline;
+		d.x = uint32_t(spec.regs[0].aligned_resolution[0] + 31) / 32;
+		d.y = uint32_t(spec.regs[0].aligned_resolution[1] + 31) / 32;
+		d.z = uint32_t(spec.regs.size());
+
+		if (spec.plane >= 0)
+		{
+			input_dispatches.push_back({ dispatches.size(), spec.plane, spec.range, dc_shift, output });
 		}
 		else
 		{
-			for (int c = 0; c < NumComponents; c++)
-			{
-				if (is_420 && c != 0 && output_level == 1)
-				{
-					// 420 chroma enters the pyramid at level 1, straight from the input plane.
-					DWTRegisters chroma_regs = regs;
-					chroma_regs.resolution[0] = plane_width(c);
-					chroma_regs.resolution[1] = plane_height(c);
-					chroma_regs.aligned_resolution[0] = layout.aligned_width >> output_level;
-					chroma_regs.aligned_resolution[1] = layout.aligned_height >> output_level;
-					chroma_regs.inv_resolution[0] = 1.0f / float(chroma_regs.resolution[0]);
-					chroma_regs.inv_resolution[1] = 1.0f / float(chroma_regs.resolution[1]);
-					if (!add(output_level, c, chroma_regs, 1, c, nullptr))
-						return false;
-				}
-				else
-				{
-					if (!add(output_level, c, regs, 0, -1, pyramid.component_ll_views[c][output_level - 1]))
-						return false;
-				}
-			}
+			const BindingResource resources[] = {
+				dwt_table.bind(0, spec.range),
+				bind_view(1, pyramid.level_views[spec.level - 1]),
+				bind_sampler(2, device->mirror_repeat_sampler),
+				bind_view(3, output),
+			};
+			d.bind_group = create_bind_group(device, device->dwt[dc_shift], resources, 4);
+			if (!d.bind_group)
+				return false;
 		}
+
+		dispatches.push_back(d);
 	}
 
 	return true;
@@ -621,21 +660,20 @@ bool pyrowave_webgpu_encoder_opaque::init(pyrowave_webgpu_device device_, int wi
 		input_textures[plane] = wgpuDeviceCreateTexture(device->device, &desc);
 		if (!input_textures[plane])
 			return false;
-		input_views[plane] = wgpuTextureCreateView(input_textures[plane], nullptr);
+		input_views[plane] = create_plane_view(input_textures[plane]);
 		if (!input_views[plane])
 			return false;
 	}
 
-	// One uniform slot per dispatch that has its own: at most 15 DWT dispatches (444)
-	// and resolve. The batched stages keep theirs in their band tables.
-	constexpr uint32_t MaxUniformSlots = 15 + 1;
+	// Only resolve still reads a uniform block.
+	constexpr uint32_t MaxUniformSlots = 1;
 	uniform_buffer = create_buffer(device, uint64_t(MaxUniformSlots) * UniformSlotSize,
 	                               WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "encoder-uniforms");
 	if (!uniform_buffer)
 		return false;
 
 	uint32_t slot = 0;
-	if (!plan_dwt(slot) || !plan_quant_analyze() || !plan_resolve(slot) || !plan_packing())
+	if (!plan_dwt() || !plan_quant_analyze() || !plan_resolve(slot) || !plan_packing())
 		return false;
 	if (slot > MaxUniformSlots)
 		return false;
@@ -660,6 +698,7 @@ void pyrowave_webgpu_encoder_opaque::release()
 	quant_bands.release();
 	analyze_bands.release();
 	packing_bands.release();
+	dwt_table.release();
 
 	for (auto &stage : stages)
 		for (auto &d : stage)
@@ -743,21 +782,33 @@ pyrowave_webgpu_result pyrowave_webgpu_encoder_opaque::prepare_frame(const pyrow
 	return PYROWAVE_WEBGPU_SUCCESS;
 }
 
-pyrowave_webgpu_result pyrowave_webgpu_encoder_opaque::submit_frame(const WGPUTextureView *planes)
+pyrowave_webgpu_result pyrowave_webgpu_encoder_opaque::submit_frame(const WGPUTexture *planes)
 {
 	std::vector<WGPUBindGroup> temporary_groups;
+	WGPUTextureView temporary_views[NumComponents] = {};
 	auto &dwt = stages[STAGE_DWT];
+
+	const auto release_temporaries = [&]()
+	{
+		for (auto g : temporary_groups)
+			wgpuBindGroupRelease(g);
+		for (auto &view : temporary_views)
+			if (view)
+				wgpuTextureViewRelease(view);
+	};
 
 	for (size_t i = 0; i < input_dispatches.size(); i++)
 	{
 		auto &input = input_dispatches[i];
 		if (planes)
 		{
-			WGPUBindGroup group = create_input_group(input, planes[input.plane]);
+			auto &view = temporary_views[input.plane];
+			if (!view)
+				view = create_plane_view(planes[input.plane]);
+			WGPUBindGroup group = view ? create_input_group(input, view) : nullptr;
 			if (!group)
 			{
-				for (auto g : temporary_groups)
-					wgpuBindGroupRelease(g);
+				release_temporaries();
 				return PYROWAVE_WEBGPU_ERROR_INVALID_ARGUMENT;
 			}
 			temporary_groups.push_back(group);
@@ -797,8 +848,7 @@ pyrowave_webgpu_result pyrowave_webgpu_encoder_opaque::submit_frame(const WGPUTe
 	wgpuCommandBufferRelease(cmd_buffer);
 	wgpuCommandEncoderRelease(cmd);
 
-	for (auto g : temporary_groups)
-		wgpuBindGroupRelease(g);
+	release_temporaries();
 	for (auto &input : input_dispatches)
 		dwt[input.dispatch_index].bind_group = nullptr;
 

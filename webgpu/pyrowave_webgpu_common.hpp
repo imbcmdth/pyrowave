@@ -43,11 +43,9 @@ enum class BindingType
 	Uniform,
 	StorageRead,
 	StorageReadWrite,
-	Texture2D,        // unfilterable float
-	Texture2DArray,   // unfilterable float
-	Sampler,          // non-filtering
-	StorageTexture2D, // r32float, write only
-	StorageTexture2DArray
+	Texture2DArray,        // unfilterable float
+	Sampler,               // non-filtering
+	StorageTexture2DArray, // r32float, write only
 };
 
 struct BindingLayout
@@ -99,11 +97,8 @@ struct Dispatch
 struct WaveletPyramid
 {
 	WGPUTexture texture = nullptr;
-	// 4 layer array views, one per component and level.
-	WGPUTextureView component_layer_views[NumComponents][DecompositionLevels] = {};
-	// Single layer 2D views of band 0 (LL).
-	WGPUTextureView component_ll_views[NumComponents][DecompositionLevels] = {};
-	// All 12 layers of one level, for dispatches that cover every band of a level.
+	// All 12 layers of one level. Every stage addresses a component and band as
+	// layer component * 4 + band, and works on all components of a level at once.
 	WGPUTextureView level_views[DecompositionLevels] = {};
 	// Everything, for the quantizer, which reads all levels in one dispatch.
 	WGPUTextureView full_view = nullptr;
@@ -151,6 +146,38 @@ struct BandTable
 	BindingResource bind_registers() const { return bind_buffer(0, buffer, 0, registers.size()); }
 	BindingResource bind_ranges() const { return bind_buffer(7, buffer, ranges_offset(), ranges.size() * sizeof(uint32_t)); }
 	Dispatch dispatch(WGPUComputePipeline pipeline, WGPUBindGroup group) const;
+	void release();
+};
+
+// Register blocks for dispatches that run several components at once, one per
+// workgroup_id.z (the transforms). Each dispatch's entries sit at their own offset,
+// aligned for a storage buffer binding.
+struct DispatchTable
+{
+	WGPUBuffer buffer = nullptr;
+	std::vector<uint8_t> data;
+
+	struct Range
+	{
+		uint64_t offset;
+		uint64_t size;
+	};
+
+	template <typename T>
+	Range add(const T *entries, uint32_t count)
+	{
+		static_assert(sizeof(T) % 16 == 0, "Registers must be a multiple of 16 bytes.");
+		Range range = { (uint64_t(data.size()) + 255) & ~uint64_t(255), uint64_t(sizeof(T)) * count };
+		data.resize(size_t(range.offset + range.size));
+		memcpy(data.data() + range.offset, entries, size_t(range.size));
+		return range;
+	}
+
+	bool create(pyrowave_webgpu_device device, const char *label);
+	BindingResource bind(uint32_t binding, const Range &range) const
+	{
+		return bind_buffer(binding, buffer, range.offset, range.size);
+	}
 	void release();
 };
 

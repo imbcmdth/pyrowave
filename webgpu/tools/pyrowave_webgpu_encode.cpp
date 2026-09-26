@@ -173,7 +173,7 @@ int main(int argc, char **argv)
 			desc.size = { uint32_t(i ? chroma_width : width), uint32_t(i ? chroma_height : height), 1 };
 			desc.format = WGPUTextureFormat_R8Unorm;
 			textures[i] = wgpuDeviceCreateTexture(wgpu_device, &desc);
-			gpu.planes[i] = wgpuTextureCreateView(textures[i], nullptr);
+			gpu.planes[i] = textures[i];
 		}
 	}
 
@@ -293,8 +293,6 @@ int main(int argc, char **argv)
 	pyrowave_webgpu_encoder_destroy(encoder);
 	for (int i = 0; i < 3; i++)
 	{
-		if (gpu.planes[i])
-			wgpuTextureViewRelease(gpu.planes[i]);
 		if (textures[i])
 			wgpuTextureRelease(textures[i]);
 	}

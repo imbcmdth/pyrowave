@@ -9,6 +9,11 @@
 //   with subgroups for speed; nothing depends on it, so this uses
 //   local_invocation_index and needs no subgroup support.
 // - Output is r32float, rounded through FP16 where the GLSL stores R16F.
+// - The components of a level that read from the pyramid run as one dispatch, one
+//   per workgroup_id.z, each with its own registers, since WebGPU puts barriers
+//   between dispatches. So the input is an array texture read at input_layer (a
+//   one layer view for the input planes) and the output is the level's 12 layers,
+//   written from output_layer.
 
 struct Registers
 {
@@ -16,13 +21,19 @@ struct Registers
     inv_resolution: vec2<f32>,
     aligned_resolution: vec2<i32>,
     store_fp16: u32,
-    padding: u32,
+    input_layer: i32,
+    output_layer: i32,
+    padding0: u32,
+    padding1: u32,
+    padding2: u32,
 };
 
-@group(0) @binding(0) var<uniform> registers: Registers;
-@group(0) @binding(1) var uTexture: texture_2d<f32>;
+@group(0) @binding(0) var<storage, read> dispatch_registers: array<Registers>;
+@group(0) @binding(1) var uTexture: texture_2d_array<f32>;
 @group(0) @binding(2) var uSampler: sampler; // Nearest, mirror repeat.
 @group(0) @binding(3) var uOutput: texture_storage_2d_array<r32float, write>;
+
+var<private> registers: Registers;
 
 override DCShift: bool = false;
 
@@ -42,7 +53,7 @@ fn generate_mirror_uv(coord_in: vec2<i32>) -> vec2<f32>
 
 fn gather_texels(coord: vec2<i32>) -> vec4<f32>
 {
-    var texels = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord)).wzxy);
+    var texels = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord), registers.input_layer).wzxy);
     if (DCShift)
     {
         texels -= vec4<f32>(0.5);
@@ -193,6 +204,7 @@ fn main(@builtin(local_invocation_index) local_invocation_index: u32,
 {
     local_index = local_invocation_index;
     workgroup_id = vec2<i32>(wg_id.xy);
+    registers = dispatch_registers[wg_id.z];
 
     load_image_with_apron();
 
@@ -224,10 +236,11 @@ fn main(@builtin(local_invocation_index) local_invocation_index: u32,
             let img_y = y;
 
             let base_image_coord = workgroup_id * (BLOCK_SIZE / 2) + vec2<i32>(img_x, img_y);
-            textureStore(uOutput, base_image_coord, 0, vec4<f32>(round_wavelet(v0.x, fp16)));
-            textureStore(uOutput, base_image_coord, 2, vec4<f32>(round_wavelet(v0.y, fp16)));
-            textureStore(uOutput, base_image_coord, 1, vec4<f32>(round_wavelet(v1.x, fp16)));
-            textureStore(uOutput, base_image_coord, 3, vec4<f32>(round_wavelet(v1.y, fp16)));
+            let layer = registers.output_layer;
+            textureStore(uOutput, base_image_coord, layer + 0, vec4<f32>(round_wavelet(v0.x, fp16)));
+            textureStore(uOutput, base_image_coord, layer + 2, vec4<f32>(round_wavelet(v0.y, fp16)));
+            textureStore(uOutput, base_image_coord, layer + 1, vec4<f32>(round_wavelet(v1.x, fp16)));
+            textureStore(uOutput, base_image_coord, layer + 3, vec4<f32>(round_wavelet(v1.y, fp16)));
         }
     }
 }

@@ -10,6 +10,10 @@
 //   format in core WebGPU, so the planes are a plain buffer of packed bytes instead,
 //   which is also what the CPU readback wants. Each thread packs four horizontally
 //   adjacent pixels into one u32.
+// - The components of a level run as one dispatch, one per workgroup_id.z, each with
+//   its own registers, since WebGPU puts barriers between dispatches. The input is
+//   the level's 12 layers, read from input_layer, and main writes the LL layer of
+//   the next level up at output_layer.
 
 struct Registers
 {
@@ -21,17 +25,19 @@ struct Registers
     output_offset: u32,
     output_stride: u32,
     output_rows: u32,
+    input_layer: i32,
+    output_layer: i32,
     padding0: u32,
     padding1: u32,
-    padding2: u32,
-    padding3: u32,
 };
 
-@group(0) @binding(0) var<uniform> registers: Registers;
+@group(0) @binding(0) var<storage, read> dispatch_registers: array<Registers>;
 @group(0) @binding(1) var uTexture: texture_2d_array<f32>;
 @group(0) @binding(2) var uSampler: sampler; // Nearest, mirror repeat.
-@group(0) @binding(3) var uOutput: texture_storage_2d<r32float, write>;
+@group(0) @binding(3) var uOutput: texture_storage_2d_array<r32float, write>;
 @group(0) @binding(4) var<storage, read_write> uOutputPlane: array<u32>;
+
+var<private> registers: Registers;
 
 var<private> workgroup_id: vec2<i32>;
 
@@ -65,10 +71,10 @@ fn load_image_with_apron()
 
     // Transpose on load.
     {
-        let texels0 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, true, true), 0).wxzy);
-        let texels1 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, false, true), 2).wxzy);
-        let texels2 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, true, false), 1).wxzy);
-        let texels3 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, false, false), 3).wxzy);
+        let texels0 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, true, true), registers.input_layer + 0).wxzy);
+        let texels1 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, false, true), registers.input_layer + 2).wxzy);
+        let texels2 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, true, false), registers.input_layer + 1).wxzy);
+        let texels3 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(coord0, false, false), registers.input_layer + 3).wxzy);
         write_shared_4x4(local_coord0, texels0, texels1, texels2, texels3);
     }
 
@@ -76,10 +82,10 @@ fn load_image_with_apron()
     if (local_coord_horiz.y < BLOCK_SIZE_HALF + 2 * APRON_HALF)
     {
         let c = base_coord + local_coord_horiz;
-        let texels0 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, true), 0).wxzy);
-        let texels1 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, true), 2).wxzy);
-        let texels2 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, false), 1).wxzy);
-        let texels3 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, false), 3).wxzy);
+        let texels0 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, true), registers.input_layer + 0).wxzy);
+        let texels1 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, true), registers.input_layer + 2).wxzy);
+        let texels2 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, false), registers.input_layer + 1).wxzy);
+        let texels3 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, false), registers.input_layer + 3).wxzy);
         write_shared_4x4(local_coord_horiz, texels0, texels1, texels2, texels3);
     }
 
@@ -87,10 +93,10 @@ fn load_image_with_apron()
     if (local_coord_vert.x < BLOCK_SIZE_HALF)
     {
         let c = base_coord + local_coord_vert;
-        let texels0 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, true), 0).wxzy);
-        let texels1 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, true), 2).wxzy);
-        let texels2 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, false), 1).wxzy);
-        let texels3 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, false), 3).wxzy);
+        let texels0 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, true), registers.input_layer + 0).wxzy);
+        let texels1 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, true), registers.input_layer + 2).wxzy);
+        let texels2 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, true, false), registers.input_layer + 1).wxzy);
+        let texels3 = mediump_texels(textureGather(0, uTexture, uSampler, generate_mirror_uv(c, false, false), registers.input_layer + 3).wxzy);
         write_shared_4x4(local_coord_vert, texels0, texels1, texels2, texels3);
     }
 
@@ -193,6 +199,7 @@ fn transform_tile(local_invocation_index: u32, wg_id: vec3<u32>)
 {
     local_index = local_invocation_index;
     workgroup_id = vec2<i32>(wg_id.xy);
+    registers = dispatch_registers[wg_id.z];
 
     load_image_with_apron();
 
@@ -224,8 +231,10 @@ fn main(@builtin(local_invocation_index) local_invocation_index: u32,
         for (var x = local_coord.x; x < BLOCK_SIZE; x += 8)
         {
             let v = load_shared(y, x);
-            textureStore(uOutput, vec2<i32>(2 * y + 0, x) + BLOCK_SIZE * workgroup_id.yx, vec4<f32>(round_wavelet(v.x, fp16)));
-            textureStore(uOutput, vec2<i32>(2 * y + 1, x) + BLOCK_SIZE * workgroup_id.yx, vec4<f32>(round_wavelet(v.y, fp16)));
+            textureStore(uOutput, vec2<i32>(2 * y + 0, x) + BLOCK_SIZE * workgroup_id.yx, registers.output_layer,
+                         vec4<f32>(round_wavelet(v.x, fp16)));
+            textureStore(uOutput, vec2<i32>(2 * y + 1, x) + BLOCK_SIZE * workgroup_id.yx, registers.output_layer,
+                         vec4<f32>(round_wavelet(v.y, fp16)));
         }
     }
 }

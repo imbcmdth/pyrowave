@@ -205,13 +205,15 @@ typedef struct pyrowave_webgpu_rate_control
 	size_t maximum_bitstream_size;
 } pyrowave_webgpu_rate_control;
 
-// GPU input: one single channel texture view per plane (r8unorm, r16unorm or any
-// float format that can be sampled as float), created with
-// WGPUTextureUsage_TextureBinding. Plane 0 is width x height; for 420 chroma, planes 1
-// and 2 are (width / 2) x (height / 2), and for 444 they match plane 0.
+// GPU input: one single channel 2D texture per plane (r8unorm, r16unorm or any float
+// format that can be sampled as unfilterable float), created with
+// WGPUTextureUsage_TextureBinding. Only mip 0 and layer 0 are read. Plane 0 is
+// width x height; for 420 chroma, planes 1 and 2 are (width / 2) x (height / 2), and
+// for 444 they match plane 0. Textures rather than views, because PyroWave needs a
+// particular view of them.
 typedef struct pyrowave_webgpu_gpu_input
 {
-	WGPUTextureView planes[3];
+	WGPUTexture planes[3];
 } pyrowave_webgpu_gpu_input;
 
 PYROWAVE_WEBGPU_PUBLIC_API pyrowave_webgpu_result
@@ -230,8 +232,8 @@ pyrowave_webgpu_encoder_encode_cpu(pyrowave_webgpu_encoder encoder,
                                    const pyrowave_webgpu_cpu_buffer *input,
                                    const pyrowave_webgpu_rate_control *rate_control);
 
-// The views must stay alive until this returns; WebGPU keeps the textures alive for
-// the submitted work.
+// The textures must stay alive until this returns; WebGPU keeps them alive for the
+// submitted work.
 PYROWAVE_WEBGPU_PUBLIC_API pyrowave_webgpu_result
 pyrowave_webgpu_encoder_encode_gpu(pyrowave_webgpu_encoder encoder,
                                    const pyrowave_webgpu_gpu_input *input,

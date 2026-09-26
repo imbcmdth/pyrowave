@@ -120,30 +120,6 @@ bool WaveletPyramid::init(pyrowave_webgpu_device device, const BlockLayout &layo
 
 	for (int level = 0; level < DecompositionLevels; level++)
 	{
-		for (int component = 0; component < NumComponents; component++)
-		{
-			WGPUTextureViewDescriptor view = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
-			view.format = WGPUTextureFormat_R32Float;
-			view.baseMipLevel = uint32_t(level);
-			view.mipLevelCount = 1;
-			view.baseArrayLayer = uint32_t(NumFrequencyBandsPerLevel * component);
-			view.aspect = WGPUTextureAspect_All;
-
-			view.dimension = WGPUTextureViewDimension_2DArray;
-			view.arrayLayerCount = NumFrequencyBandsPerLevel;
-			component_layer_views[component][level] = wgpuTextureCreateView(texture, &view);
-
-			view.dimension = WGPUTextureViewDimension_2D;
-			view.arrayLayerCount = 1;
-			component_ll_views[component][level] = wgpuTextureCreateView(texture, &view);
-
-			if (!component_layer_views[component][level] || !component_ll_views[component][level])
-				return false;
-		}
-	}
-
-	for (int level = 0; level < DecompositionLevels; level++)
-	{
 		WGPUTextureViewDescriptor view = WGPU_TEXTURE_VIEW_DESCRIPTOR_INIT;
 		view.format = WGPUTextureFormat_R32Float;
 		view.dimension = WGPUTextureViewDimension_2DArray;
@@ -226,14 +202,6 @@ void WaveletPyramid::dump(pyrowave_webgpu_device device, const BlockLayout &layo
 
 void WaveletPyramid::release()
 {
-	for (auto &component_views : component_layer_views)
-		for (auto &view : component_views)
-			if (view)
-				wgpuTextureViewRelease(view);
-	for (auto &component_views : component_ll_views)
-		for (auto &view : component_views)
-			if (view)
-				wgpuTextureViewRelease(view);
 	for (auto &view : level_views)
 		if (view)
 			wgpuTextureViewRelease(view);
@@ -271,6 +239,22 @@ Dispatch BandTable::dispatch(WGPUComputePipeline pipeline, WGPUBindGroup group) 
 	d.y = (total_workgroups + d.x - 1) / d.x;
 	d.z = 1;
 	return d;
+}
+
+bool DispatchTable::create(pyrowave_webgpu_device device, const char *label)
+{
+	buffer = create_buffer(device, data.size(), WGPUBufferUsage_Storage | WGPUBufferUsage_CopyDst, label);
+	if (!buffer)
+		return false;
+	wgpuQueueWriteBuffer(device->queue, buffer, 0, data.data(), (data.size() + 3) & ~size_t(3));
+	return true;
+}
+
+void DispatchTable::release()
+{
+	if (buffer)
+		wgpuBufferRelease(buffer);
+	*this = {};
 }
 
 void BandTable::release()
@@ -442,7 +426,7 @@ bool create_encode_pipelines(pyrowave_webgpu_device device)
 	for (int dc_shift = 0; dc_shift < 2; dc_shift++)
 	{
 		static const BindingLayout layout[] = {
-			{ 0, B::Uniform }, { 1, B::Texture2D }, { 2, B::Sampler }, { 3, B::StorageTexture2DArray },
+			{ 0, B::StorageRead }, { 1, B::Texture2DArray }, { 2, B::Sampler }, { 3, B::StorageTexture2DArray },
 		};
 		device->dwt[dc_shift] = device->create_pipeline(
 				dc_shift ? "dwt-dc-shift" : "dwt", { wgsl_common, wgsl_dwt_common, wgsl_dwt },
@@ -528,7 +512,7 @@ static bool create_decode_pipelines(pyrowave_webgpu_device device)
 
 	{
 		static const BindingLayout layout[] = {
-			{ 0, B::Uniform }, { 1, B::Texture2DArray }, { 2, B::Sampler }, { 3, B::StorageTexture2D },
+			{ 0, B::StorageRead }, { 1, B::Texture2DArray }, { 2, B::Sampler }, { 3, B::StorageTexture2DArray },
 		};
 		device->idwt = device->create_pipeline(
 				"idwt", { wgsl_common, wgsl_dwt_common, wgsl_idwt },
@@ -539,7 +523,7 @@ static bool create_decode_pipelines(pyrowave_webgpu_device device)
 
 	{
 		static const BindingLayout layout[] = {
-			{ 0, B::Uniform }, { 1, B::Texture2DArray }, { 2, B::Sampler }, { 4, B::StorageReadWrite },
+			{ 0, B::StorageRead }, { 1, B::Texture2DArray }, { 2, B::Sampler }, { 4, B::StorageReadWrite },
 		};
 		device->idwt_final = device->create_pipeline(
 				"idwt-final", { wgsl_common, wgsl_dwt_common, wgsl_idwt },
@@ -687,21 +671,17 @@ Pipeline pyrowave_webgpu_device_opaque::create_pipeline(
 		case BindingType::StorageReadWrite:
 			entry.buffer.type = WGPUBufferBindingType_Storage;
 			break;
-		case BindingType::Texture2D:
 		case BindingType::Texture2DArray:
 			entry.texture.sampleType = WGPUTextureSampleType_UnfilterableFloat;
-			entry.texture.viewDimension = bindings[i].type == BindingType::Texture2D ?
-			                              WGPUTextureViewDimension_2D : WGPUTextureViewDimension_2DArray;
+			entry.texture.viewDimension = WGPUTextureViewDimension_2DArray;
 			break;
 		case BindingType::Sampler:
 			entry.sampler.type = WGPUSamplerBindingType_NonFiltering;
 			break;
-		case BindingType::StorageTexture2D:
 		case BindingType::StorageTexture2DArray:
 			entry.storageTexture.access = WGPUStorageTextureAccess_WriteOnly;
 			entry.storageTexture.format = WGPUTextureFormat_R32Float;
-			entry.storageTexture.viewDimension = bindings[i].type == BindingType::StorageTexture2D ?
-			                                     WGPUTextureViewDimension_2D : WGPUTextureViewDimension_2DArray;
+			entry.storageTexture.viewDimension = WGPUTextureViewDimension_2DArray;
 			break;
 		}
 	}

@@ -37,7 +37,9 @@ struct IDWTRegisters
 	uint32_t output_offset;
 	uint32_t output_stride;
 	uint32_t output_rows;
-	uint32_t padding[4];
+	int32_t input_layer;
+	int32_t output_layer;
+	uint32_t padding[2];
 };
 static_assert(sizeof(IDWTRegisters) == 48, "Must match Registers in the WGSL.");
 
@@ -67,10 +69,9 @@ struct pyrowave_webgpu_decoder_opaque
 	uint32_t plane_offset[3] = {};
 	uint32_t plane_stride[3] = {};
 
-	WGPUBuffer uniform_buffer = nullptr;
-	std::vector<uint8_t> uniform_data;
-
 	std::vector<Dispatch> stages[STAGE_COUNT];
+	// The iDWT runs the components of a level together, see plan_idwt().
+	DispatchTable idwt_table;
 	// One dequant dispatch per level, covering its components and bands.
 	BandTable dequant_bands[DecompositionLevels];
 
@@ -81,7 +82,7 @@ struct pyrowave_webgpu_decoder_opaque
 
 	bool init(pyrowave_webgpu_device device, int width, int height, ChromaSubsampling chroma);
 	void release();
-	bool plan_idwt(uint32_t &slot);
+	bool plan_idwt();
 	bool plan_dequant();
 	bool rebuild_dequant_groups();
 
@@ -170,10 +171,19 @@ bool pyrowave_webgpu_decoder_opaque::rebuild_dequant_groups()
 	return true;
 }
 
-bool pyrowave_webgpu_decoder_opaque::plan_idwt(uint32_t &slot)
+bool pyrowave_webgpu_decoder_opaque::plan_idwt()
 {
-	// Mirrors Decoder::Impl::idwt().
-	auto &dispatches = stages[STAGE_IDWT];
+	// Mirrors Decoder::Impl::idwt(). Per level, the components that write the next
+	// LL band share one dispatch and the ones that write an output plane share
+	// another, one component per workgroup_id.z.
+	struct Spec
+	{
+		int input_level;
+		bool final_output;
+		std::vector<IDWTRegisters> regs;
+		DispatchTable::Range range;
+	};
+	std::vector<Spec> specs;
 	const bool is_420 = layout.chroma == ChromaSubsampling::Chroma420;
 
 	for (int input_level = DecompositionLevels - 1; input_level >= 0; input_level--)
@@ -185,54 +195,76 @@ bool pyrowave_webgpu_decoder_opaque::plan_idwt(uint32_t &slot)
 		regs.inv_resolution[0] = 1.0f / float(regs.resolution[0]);
 		regs.inv_resolution[1] = 1.0f / float(regs.resolution[1]);
 
+		Spec to_pyramid = { input_level, false, {}, {} };
+		Spec to_planes = { input_level, true, {}, {} };
+
 		for (int c = 0; c < NumComponents; c++)
 		{
-			bool final_output = input_level == 0 || (is_420 && c != 0 && input_level == 1);
 			if (input_level == 0 && is_420 && c != 0)
 				continue;
 
-			IDWTRegisters component_regs = regs;
-			Dispatch d = {};
-			d.x = uint32_t(regs.resolution[0] + 15) / 16;
-			d.y = uint32_t(regs.resolution[1] + 15) / 16;
-			d.z = 1;
+			IDWTRegisters component = regs;
+			component.input_layer = NumFrequencyBandsPerLevel * c;
 
-			if (final_output)
+			if (input_level == 0 || (is_420 && c != 0 && input_level == 1))
 			{
-				component_regs.output_offset = plane_offset[c];
-				component_regs.output_stride = plane_stride[c];
-				component_regs.output_rows = uint32_t(aligned_plane_height(c));
-				write_uniform(uniform_data, slot, component_regs);
-
-				const BindingResource resources[] = {
-					bind_buffer(0, uniform_buffer, uint64_t(slot) * UniformSlotSize, sizeof(IDWTRegisters)),
-					bind_view(1, pyramid.component_layer_views[c][input_level]),
-					bind_sampler(2, device->mirror_repeat_sampler),
-					bind_buffer(4, output_buffer),
-				};
-				d.pipeline = device->idwt_final.pipeline;
-				d.bind_group = create_bind_group(device, device->idwt_final, resources, 4);
+				component.output_offset = plane_offset[c];
+				component.output_stride = plane_stride[c];
+				component.output_rows = uint32_t(aligned_plane_height(c));
+				to_planes.regs.push_back(component);
 			}
 			else
 			{
-				component_regs.store_fp16 = device->precision == 1 && (input_level - 1) < WaveletFP16Levels;
-				write_uniform(uniform_data, slot, component_regs);
-
-				const BindingResource resources[] = {
-					bind_buffer(0, uniform_buffer, uint64_t(slot) * UniformSlotSize, sizeof(IDWTRegisters)),
-					bind_view(1, pyramid.component_layer_views[c][input_level]),
-					bind_sampler(2, device->mirror_repeat_sampler),
-					bind_view(3, pyramid.component_ll_views[c][input_level - 1]),
-				};
-				d.pipeline = device->idwt.pipeline;
-				d.bind_group = create_bind_group(device, device->idwt, resources, 4);
+				component.store_fp16 = device->precision == 1 && (input_level - 1) < WaveletFP16Levels;
+				component.output_layer = NumFrequencyBandsPerLevel * c;
+				to_pyramid.regs.push_back(component);
 			}
-
-			if (!d.bind_group)
-				return false;
-			dispatches.push_back(d);
-			slot++;
 		}
+
+		if (!to_pyramid.regs.empty())
+			specs.push_back(to_pyramid);
+		if (!to_planes.regs.empty())
+			specs.push_back(to_planes);
+	}
+
+	for (auto &spec : specs)
+		spec.range = idwt_table.add(spec.regs.data(), uint32_t(spec.regs.size()));
+	if (!idwt_table.create(device, "idwt-registers"))
+		return false;
+
+	for (auto &spec : specs)
+	{
+		Dispatch d = {};
+		d.x = uint32_t(spec.regs[0].resolution[0] + 15) / 16;
+		d.y = uint32_t(spec.regs[0].resolution[1] + 15) / 16;
+		d.z = uint32_t(spec.regs.size());
+
+		if (spec.final_output)
+		{
+			const BindingResource resources[] = {
+				idwt_table.bind(0, spec.range),
+				bind_view(1, pyramid.level_views[spec.input_level]),
+				bind_sampler(2, device->mirror_repeat_sampler),
+				bind_buffer(4, output_buffer),
+			};
+			d.pipeline = device->idwt_final.pipeline;
+			d.bind_group = create_bind_group(device, device->idwt_final, resources, 4);
+		}
+		else
+		{
+			const BindingResource resources[] = {
+				idwt_table.bind(0, spec.range),
+				bind_view(1, pyramid.level_views[spec.input_level]),
+				bind_sampler(2, device->mirror_repeat_sampler),
+				bind_view(3, pyramid.level_views[spec.input_level - 1]),
+			};
+			d.pipeline = device->idwt.pipeline;
+			d.bind_group = create_bind_group(device, device->idwt, resources, 4);
+		}
+
+		if (!d.bind_group)
+			return false;
+		stages[STAGE_IDWT].push_back(d);
 	}
 
 	return true;
@@ -272,21 +304,8 @@ bool pyrowave_webgpu_decoder_opaque::init(pyrowave_webgpu_device device_, int wi
 	if (!output_buffer)
 		return false;
 
-	// At most 15 iDWT dispatches.
-	constexpr uint32_t MaxUniformSlots = 15;
-	uniform_buffer = create_buffer(device, uint64_t(MaxUniformSlots) * UniformSlotSize,
-	                               WGPUBufferUsage_Uniform | WGPUBufferUsage_CopyDst, "decoder-uniforms");
-	if (!uniform_buffer)
+	if (!plan_dequant() || !plan_idwt() || !rebuild_dequant_groups())
 		return false;
-
-	uint32_t slot = 0;
-	if (!plan_dequant() || !plan_idwt(slot) || !rebuild_dequant_groups())
-		return false;
-	if (slot > MaxUniformSlots)
-		return false;
-
-	// Nothing in here changes per frame.
-	wgpuQueueWriteBuffer(device->queue, uniform_buffer, 0, uniform_data.data(), uniform_data.size());
 
 	if (!timer.init(device, STAGE_COUNT))
 		return false;
@@ -303,13 +322,14 @@ void pyrowave_webgpu_decoder_opaque::release()
 	timer.release();
 	for (auto &table : dequant_bands)
 		table.release();
+	idwt_table.release();
 
 	for (auto &stage : stages)
 		for (auto &d : stage)
 			if (d.bind_group)
 				wgpuBindGroupRelease(d.bind_group);
 
-	WGPUBuffer buffers[] = { dequant_offset_buffer, payload_buffer, output_buffer, uniform_buffer };
+	WGPUBuffer buffers[] = { dequant_offset_buffer, payload_buffer, output_buffer };
 	for (auto buf : buffers)
 		if (buf)
 			wgpuBufferRelease(buf);
