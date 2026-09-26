@@ -294,7 +294,10 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     {
         return;
     }
-    registers = band_registers[band.band];
+    // A let of a read-only storage load at a uniform index is uniform for WGSL's
+    // uniformity analysis; the module scope copy for helper functions is not.
+    let regs = band_registers[band.band];
+    registers = regs;
     let wg_id = band.id;
 
     let subgroup_id = allocate_subgroup_id(local_invocation_index, subgroup_invocation_id);
@@ -311,22 +314,22 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     var meta_entry = vec2<u32>(0u, 0u);
     var quant = 0;
 
-    let in_range_8x8 = all(block8x8_index < registers.resolution_8x8_blocks);
-    let in_range_32x32 = all(block32x32_index < registers.resolution_32x32_blocks);
+    let in_range_8x8 = all(block8x8_index < regs.resolution_8x8_blocks);
+    let in_range_32x32 = all(block32x32_index < regs.resolution_32x32_blocks);
     var num_bits_for_q = 0u;
 
     if (in_range_32x32)
     {
-        let block_index = registers.block_offset_32x32 +
-            registers.block_stride_32x32 * block32x32_index.y +
+        let block_index = regs.block_offset_32x32 +
+            regs.block_stride_32x32 * block32x32_index.y +
             block32x32_index.x;
         quant = quant_data[block_index];
     }
 
     if (in_range_8x8)
     {
-        let block_index = u32(registers.block_offset_8x8 +
-            registers.block_stride_8x8 * block8x8_index.y +
+        let block_index = u32(regs.block_offset_8x8 +
+            regs.block_stride_8x8 * block8x8_index.y +
             block8x8_index.x);
         meta_entry = block_meta[block_index];
         let num_planes = block_stats[block_index * BLOCK_STATS_WORDS];
@@ -350,7 +353,7 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     }
 
     let writes_header =
-        all(block32x32_index < registers.resolution_32x32_blocks) && (index & 15u) == 15u;
+        all(block32x32_index < regs.resolution_32x32_blocks) && (index & 15u) == 15u;
 
     let payload_total_bits = clustered_add16(required_bits_with_meta);
     var payload_total_words = (payload_total_bits + 31u) / 32u;
@@ -387,15 +390,15 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
 
     if (writes_header)
     {
-        let block_index = u32(registers.block_offset_32x32 +
-            block32x32_index.y * registers.block_stride_32x32 + block32x32_index.x);
+        let block_index = u32(regs.block_offset_32x32 +
+            block32x32_index.y * regs.block_stride_32x32 + block32x32_index.x);
 
         if (payload_total_words != 0u)
         {
             atomicStore(&bitstream_data[global_payload_offset + 0u],
-                local_ballot | (payload_total_words << 16u) | (registers.sequence_code << 28u));
+                local_ballot | (payload_total_words << 16u) | (regs.sequence_code << 28u));
             atomicStore(&bitstream_data[global_payload_offset + 1u],
-                modify_quant_code(registers.quant_resolution_code, quant) | (block_index << 8u));
+                modify_quant_code(regs.quant_resolution_code, quant) | (block_index << 8u));
         }
 
         bitstream_meta[block_index] = vec2<u32>(global_payload_offset, payload_total_words);

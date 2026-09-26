@@ -145,7 +145,10 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
     {
         return;
     }
-    registers = band_registers[band.band];
+    // A let of a read-only storage load at a uniform index is uniform for WGSL's
+    // uniformity analysis; the module scope copy for helper functions is not.
+    let regs = band_registers[band.band];
+    registers = regs;
 
     let subgroup_id = allocate_subgroup_id(local_invocation_index, subgroup_invocation_id);
     lane = subgroup_invocation_id;
@@ -159,9 +162,9 @@ fn main(@builtin(workgroup_id) wg: vec3<u32>,
 
     var num_active_planes = 0u;
 
-    let block8x8_in_range = all(block8x8_index < registers.resolution_8x8_blocks);
-    let block_index_8x8 = registers.block_offset_8x8 +
-        registers.block_stride_8x8 * block8x8_index.y +
+    let block8x8_in_range = all(block8x8_index < regs.resolution_8x8_blocks);
+    let block_index_8x8 = regs.block_offset_8x8 +
+        regs.block_stride_8x8 * block8x8_index.y +
         block8x8_index.x;
 
     if (block8x8_in_range)

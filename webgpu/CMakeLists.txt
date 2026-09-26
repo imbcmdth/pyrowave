@@ -15,7 +15,16 @@ set(PYROWAVE_ROOT ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 set(PYROWAVE_WEBGPU_NATIVE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external/wgpu-native
     CACHE PATH "Prebuilt wgpu-native (include/webgpu/webgpu.h and lib/).")
+set(PYROWAVE_WEBGPU_DAWN_DIR "" CACHE PATH "A Dawn install (with lib/cmake/Dawn) to use instead of wgpu-native.")
 option(PYROWAVE_WEBGPU_TOOLS "Build the WebGPU encode and decode command line tools." ON)
+
+if (NOT TARGET webgpu AND PYROWAVE_WEBGPU_DAWN_DIR)
+	# The Dawn package links Threads::Threads without looking for it.
+	find_package(Threads REQUIRED)
+	find_package(Dawn CONFIG REQUIRED PATHS ${PYROWAVE_WEBGPU_DAWN_DIR} NO_DEFAULT_PATH)
+	add_library(webgpu INTERFACE)
+	target_link_libraries(webgpu INTERFACE dawn::webgpu_dawn)
+endif()
 
 if (NOT TARGET webgpu)
 	find_path(PYROWAVE_WEBGPU_INCLUDE_DIR webgpu/webgpu.h

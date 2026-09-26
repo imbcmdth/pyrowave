@@ -130,17 +130,20 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     {
         return;
     }
-    registers = band_registers[band.band];
+    // A let of a read-only storage load at a uniform index is uniform for WGSL's
+    // uniformity analysis; the module scope copy for helper functions is not.
+    let regs = band_registers[band.band];
+    registers = regs;
     let wg_id = band.id;
 
     let subgroup_id = allocate_subgroup_id(local_invocation_index, subgroup_invocation_id);
     let local_index = subgroup_id * subgroup_size + subgroup_invocation_id;
     let num_subgroups = max(WORKGROUP_SIZE / subgroup_size, 1u);
 
-    let fp16 = registers.store_fp16 != 0u;
+    let fp16 = regs.store_fp16 != 0u;
 
-    let block_index_32x32 = u32(registers.block_offset_32x32 +
-        i32(wg_id.y) * registers.block_stride_32x32 +
+    let block_index_32x32 = u32(regs.block_offset_32x32 +
+        i32(wg_id.y) * regs.block_stride_32x32 +
         i32(wg_id.x));
 
     let block_local_index = extractBits(local_index, 0u, 3u);
@@ -163,7 +166,7 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
         {
             for (var i = 0; i < 4; i++)
             {
-                textureStore(uDequantImg, coord + vec2<i32>(i, j), registers.output_layer, vec4<f32>(0.0));
+                textureStore(uDequantImg, coord + vec2<i32>(i, j), regs.output_layer, vec4<f32>(0.0));
             }
         }
         return;
@@ -305,7 +308,7 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     {
         for (var i = 0; i < 4; i++)
         {
-            textureStore(uDequantImg, coord + vec2<i32>(i, j), registers.output_layer,
+            textureStore(uDequantImg, coord + vec2<i32>(i, j), regs.output_layer,
                          vec4<f32>(round_wavelet(v[j][i], fp16)));
         }
     }

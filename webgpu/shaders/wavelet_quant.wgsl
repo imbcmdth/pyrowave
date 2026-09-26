@@ -386,7 +386,10 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     {
         return;
     }
-    registers = band_registers[band.band];
+    // A let of a read-only storage load at a uniform index is uniform for WGSL's
+    // uniformity analysis; the module scope copy for helper functions is not.
+    let regs = band_registers[band.band];
+    registers = regs;
     let wg_id = band.id;
 
     let subgroup_id = allocate_subgroup_id(local_invocation_index, subgroup_invocation_id);
@@ -413,9 +416,9 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     let texels1 = vec4<f32>(
         fetch_texel(coord + vec2<i32>(2, 0)), fetch_texel(coord + vec2<i32>(2, 1)),
         fetch_texel(coord + vec2<i32>(3, 0)), fetch_texel(coord + vec2<i32>(3, 1)));
-    let scaled_texels0 = texels0 * registers.quant_resolution;
-    let scaled_texels1 = texels1 * registers.quant_resolution;
-    let in_bounds = all(block_index < registers.resolution_8x8_blocks);
+    let scaled_texels0 = texels0 * regs.quant_resolution;
+    let scaled_texels1 = texels1 * regs.quant_resolution;
+    let in_bounds = all(block_index < regs.resolution_8x8_blocks);
     if (in_bounds)
     {
         encode_payload(block_index, mat2x4<f32>(scaled_texels0, scaled_texels1));

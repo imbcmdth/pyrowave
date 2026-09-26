@@ -644,8 +644,12 @@ Pipeline pyrowave_webgpu_device_opaque::create_pipeline(
 		}
 		else
 		{
+			// pack2x16float does not promise how it rounds, and on D3D12 it does not round
+			// to nearest, which costs about 0.1 dB. Round first; exact values pack exactly.
 			source += "alias SHARED_VEC2 = u32;\n"
-			          "fn shared_pack(v: vec2<f32>) -> SHARED_VEC2 { return pack2x16float(v); }\n"
+			          "fn shared_pack(v: vec2<f32>) -> SHARED_VEC2 {\n"
+			          "    return pack2x16float(round_to_f16_vec4(vec4<f32>(v, 0.0, 0.0)).xy);\n"
+			          "}\n"
 			          "fn shared_unpack(v: SHARED_VEC2) -> vec2<f32> { return unpack2x16float(v); }\n";
 		}
 	}
