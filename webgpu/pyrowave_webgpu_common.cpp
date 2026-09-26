@@ -747,8 +747,22 @@ Pipeline pyrowave_webgpu_device_opaque::create_pipeline(
 
 	if (scope.type != WGPUErrorType_NoError || !result.pipeline || !result.layout)
 	{
-		log("Failed to create pipeline %s: %s\n", label, scope.message.c_str());
 		result.release();
+
+		if (subgroups && wgsl_enable_subgroups)
+		{
+			// Some WGSL front ends reject the standard `enable subgroups;` but accept the
+			// builtins without it (naga as of wgpu 29, and so any host built on it).
+			// Try once without, and stick with that if it works.
+			wgsl_enable_subgroups = false;
+			result = create_pipeline(label, sources, subgroups, dwt_shared, entry_point,
+			                         bindings, num_bindings, constant_name, constant_value);
+			if (result.pipeline)
+				return result;
+			wgsl_enable_subgroups = true;
+		}
+
+		log("Failed to create pipeline %s: %s\n", label, scope.message.c_str());
 	}
 
 	return result;
@@ -916,8 +930,7 @@ pyrowave_webgpu_result pyrowave_webgpu_device_create(const pyrowave_webgpu_devic
 		wgpuInstanceAddRef(device->instance);
 		wgpuAdapterAddRef(device->adapter);
 		wgpuDeviceAddRef(device->device);
-		// Cannot know how the application created its instance, so do not use WaitAny.
-		device->timed_wait_any = false;
+		device->timed_wait_any = info->timed_wait_any;
 
 		bool has_subgroups = wgpuDeviceHasFeature(device->device, WGPUFeatureName_Subgroups) != 0;
 #if defined(PYROWAVE_WEBGPU_WGPU_NATIVE)
@@ -939,11 +952,9 @@ pyrowave_webgpu_result pyrowave_webgpu_device_create(const pyrowave_webgpu_devic
 	{
 		WGPUInstanceDescriptor instance_desc = WGPU_INSTANCE_DESCRIPTOR_INIT;
 		WGPUInstanceFeatureName timed_wait = WGPUInstanceFeatureName_TimedWaitAny;
-		// Blocking in wgpuInstanceWaitAny is better than spinning, but it is opt in:
-		// wgpu-native v29 panics in wgpuHasInstanceFeature, so the feature cannot even
-		// be queried there.
+		// Opt in rather than probed: wgpu-native v29 panics in wgpuHasInstanceFeature.
 		const char *wait_any_env = getenv("PYROWAVE_WEBGPU_TIMED_WAIT_ANY");
-		if (wait_any_env && strcmp(wait_any_env, "1") == 0)
+		if (info->timed_wait_any || (wait_any_env && strcmp(wait_any_env, "1") == 0))
 		{
 			instance_desc.requiredFeatureCount = 1;
 			instance_desc.requiredFeatures = &timed_wait;

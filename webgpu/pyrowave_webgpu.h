@@ -108,6 +108,13 @@ typedef struct pyrowave_webgpu_device_create_info
 	// so that the encoder and decoder can report GPU time per stage.
 	bool enable_timestamps;
 
+	// Block in wgpuInstanceWaitAny instead of spinning on wgpuInstanceProcessEvents
+	// when waiting for the GPU. If PyroWave creates the instance, it asks for
+	// WGPUInstanceFeatureName_TimedWaitAny; an instance passed in must have been
+	// created with it. Off by default because not every implementation has it
+	// (wgpu-native v29 does not). PYROWAVE_WEBGPU_TIMED_WAIT_ANY=1 also turns it on.
+	bool timed_wait_any;
+
 	// Optional message callback, or NULL to print to stderr.
 	pyrowave_webgpu_message_cb message_callback;
 	void *message_userdata;
