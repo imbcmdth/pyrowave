@@ -4,11 +4,14 @@
 // Encodes a y4m file with the WebGPU backend into the same container as encode.cpp.
 //
 //   pyrowave-webgpu-encode <input.y4m> <output.pyrowave> <bytes_per_frame>
-//       [--frames N] [--timestamps] [--transfer-bench]
+//       [--frames N] [--timestamps] [--transfer-bench] [--gpu-input | --nv12]
 //
 // Prints per frame timings at the end. --timestamps adds GPU time per stage.
 // --transfer-bench additionally measures a frame upload and a bitstream sized
-// readback on their own.
+// readback on their own. --gpu-input uploads the planes into the tool's own textures
+// and goes through pyrowave_webgpu_encoder_encode_gpu(); --nv12 interleaves the
+// chroma and passes NV12 to the CPU entry point. Both are there to exercise those
+// paths; the output does not change.
 
 #include "pyrowave_webgpu.h"
 #include "pyrowave_file_format.hpp"
@@ -27,7 +30,7 @@ int main(int argc, char **argv)
 	if (argc < 4)
 	{
 		fprintf(stderr, "Usage: pyrowave-webgpu-encode <input.y4m> <output.pyrowave> <bytes_per_frame> "
-		                "[--frames N] [--timestamps] [--transfer-bench]\n");
+		                "[--frames N] [--timestamps] [--transfer-bench] [--gpu-input | --nv12]\n");
 		return EXIT_FAILURE;
 	}
 
@@ -37,6 +40,8 @@ int main(int argc, char **argv)
 	int max_frames = -1;
 	bool timestamps = false;
 	bool transfer_bench = false;
+	bool gpu_input = false;
+	bool nv12 = false;
 
 	for (int i = 4; i < argc; i++)
 	{
@@ -46,6 +51,10 @@ int main(int argc, char **argv)
 			timestamps = true;
 		else if (strcmp(argv[i], "--transfer-bench") == 0)
 			transfer_bench = true;
+		else if (strcmp(argv[i], "--gpu-input") == 0)
+			gpu_input = true;
+		else if (strcmp(argv[i], "--nv12") == 0)
+			nv12 = true;
 		else
 		{
 			fprintf(stderr, "Unknown argument %s\n", argv[i]);
@@ -130,6 +139,44 @@ int main(int argc, char **argv)
 		cpu.plane_size_in_bytes[i] = planes[i].size();
 	}
 
+	if (nv12 && !is_420)
+	{
+		fprintf(stderr, "--nv12 needs 4:2:0 input.\n");
+		return EXIT_FAILURE;
+	}
+
+	std::vector<uint8_t> nv12_chroma;
+	if (nv12)
+	{
+		nv12_chroma.resize(size_t(chroma_width) * chroma_height * 2);
+		cpu.format = PYROWAVE_WEBGPU_CPU_BUFFER_FORMAT_NV12;
+		cpu.data[1] = nv12_chroma.data();
+		cpu.row_stride_in_bytes[1] = size_t(chroma_width) * 2;
+		cpu.plane_size_in_bytes[1] = nv12_chroma.size();
+		cpu.data[2] = nullptr;
+		cpu.row_stride_in_bytes[2] = 0;
+		cpu.plane_size_in_bytes[2] = 0;
+	}
+
+	WGPUQueue queue = nullptr;
+	WGPUTexture textures[3] = {};
+	pyrowave_webgpu_gpu_input gpu = {};
+	if (gpu_input)
+	{
+		WGPUDevice wgpu_device = nullptr;
+		pyrowave_webgpu_device_get_handles(device, nullptr, nullptr, &wgpu_device);
+		queue = wgpuDeviceGetQueue(wgpu_device);
+		for (int i = 0; i < 3; i++)
+		{
+			WGPUTextureDescriptor desc = WGPU_TEXTURE_DESCRIPTOR_INIT;
+			desc.usage = WGPUTextureUsage_TextureBinding | WGPUTextureUsage_CopyDst;
+			desc.size = { uint32_t(i ? chroma_width : width), uint32_t(i ? chroma_height : height), 1 };
+			desc.format = WGPUTextureFormat_R8Unorm;
+			textures[i] = wgpuDeviceCreateTexture(wgpu_device, &desc);
+			gpu.planes[i] = wgpuTextureCreateView(textures[i], nullptr);
+		}
+	}
+
 	pyrowave_webgpu_rate_control rate = { bytes_per_frame };
 	std::vector<uint8_t> packetized(bytes_per_frame + 64 * 1024);
 
@@ -147,9 +194,33 @@ int main(int argc, char **argv)
 		if (!ok)
 			break;
 
+		if (nv12)
+		{
+			for (size_t i = 0; i < planes[1].size(); i++)
+			{
+				nv12_chroma[2 * i + 0] = planes[1][i];
+				nv12_chroma[2 * i + 1] = planes[2][i];
+			}
+		}
+
 		Stopwatch total;
 		Stopwatch submit;
-		result = pyrowave_webgpu_encoder_encode_cpu(encoder, &cpu, &rate);
+		if (gpu_input)
+		{
+			for (int i = 0; i < 3; i++)
+			{
+				WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+				dst.texture = textures[i];
+				WGPUTexelCopyBufferLayout layout = WGPU_TEXEL_COPY_BUFFER_LAYOUT_INIT;
+				layout.bytesPerRow = uint32_t(i ? chroma_width : width);
+				layout.rowsPerImage = uint32_t(i ? chroma_height : height);
+				WGPUExtent3D extent = { layout.bytesPerRow, layout.rowsPerImage, 1 };
+				wgpuQueueWriteTexture(queue, &dst, planes[i].data(), planes[i].size(), &layout, &extent);
+			}
+			result = pyrowave_webgpu_encoder_encode_gpu(encoder, &gpu, &rate);
+		}
+		else
+			result = pyrowave_webgpu_encoder_encode_cpu(encoder, &cpu, &rate);
 		if (result != PYROWAVE_WEBGPU_SUCCESS)
 		{
 			fprintf(stderr, "Encode failed: %s\n", pyrowave_webgpu_result_to_string(result));
@@ -220,6 +291,15 @@ int main(int argc, char **argv)
 		measure_transfers(device, width, height, is_420, bytes_per_frame, 100);
 
 	pyrowave_webgpu_encoder_destroy(encoder);
+	for (int i = 0; i < 3; i++)
+	{
+		if (gpu.planes[i])
+			wgpuTextureViewRelease(gpu.planes[i]);
+		if (textures[i])
+			wgpuTextureRelease(textures[i]);
+	}
+	if (queue)
+		wgpuQueueRelease(queue);
 	pyrowave_webgpu_device_destroy(device);
 	return frames > 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -9,10 +9,11 @@
 //   cluster first zeroes the words of the packet it allocated, and after a
 //   storageBarrier every byte and 16-bit field is ORed in. Bytes a thread writes in
 //   sequence are merged into one atomicOr per word.
-// - Unused bits at the end of a packet are therefore always zero. In the GLSL they are
-//   whatever the buffer or shared_sign_bank held before, so the two encoders do not
-//   produce byte identical bitstreams even when they code identical data. Compare
-//   decoded output instead.
+// - Unused bits at the end of a packet are therefore always zero, and the sign bank
+//   is cleared, so the output is byte for byte deterministic. In the GLSL those bits
+//   are whatever the buffer or shared_sign_bank held before, so the two encoders do
+//   not produce byte identical bitstreams even when they code identical data.
+//   Compare decoded output, or the coded blocks, instead.
 // - subgroupClusteredAdd(x, 16) is a subgroupShuffleXor butterfly, and the ballot of
 //   a 16 lane cluster is picked out of the subgroup ballot by lane, which covers any
 //   subgroup size from 16 to 128. The subgroupBarrier becomes a workgroupBarrier.
@@ -299,6 +300,14 @@ fn main(@builtin(workgroup_id) workgroup_id: vec3<u32>,
     let regs = band_registers[band.band];
     registers = regs;
     let wg_id = band.id;
+
+    // Cleared explicitly so that unused sign bits come out as zero. WGSL zero
+    // initializes workgroup memory, but wgpu-native v29 was seen not to.
+    // allocate_subgroup_id() has the barrier that orders this.
+    for (var i = local_invocation_index; i < 4u * (1024u / 32u); i += 64u)
+    {
+        atomicStore(&shared_sign_bank[i / 32u][i % 32u], 0u);
+    }
 
     let subgroup_id = allocate_subgroup_id(local_invocation_index, subgroup_invocation_id);
     lane = subgroup_invocation_id;
