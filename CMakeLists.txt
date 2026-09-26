@@ -214,3 +214,7 @@ if (PYROWAVE_DEVEL AND WIN32)
     target_link_libraries(pyrowave-encode-desktop PRIVATE pyrowave-shared dxgi d3d11 pyrowave-utils)
 endif()
 
+option(PYROWAVE_WEBGPU "Also build the WebGPU backend in webgpu/." OFF)
+if (PYROWAVE_WEBGPU)
+    add_subdirectory(webgpu)
+endif()
