@@ -91,7 +91,9 @@ Each shader lists its differences at the top. In short:
 * WebGPU implementations put a barrier between dispatches that write storage.
   Upstream records one dispatch per band, about 40 per stage, which made quantize and
   packing 10 to 20 times slower here. Quantize, analyze, packing and each dequant
-  level run all their bands in one dispatch instead (`shaders/band_dispatch.wgsl`).
+  level run all their bands in one dispatch instead (`shaders/band_dispatch.wgsl`),
+  and the transforms run the components of a level together, one per
+  `workgroup_id.z`.
 * `analyze_rate_control_finalize` runs 256 invocations playing the GLSL's 512, since
   256 is the default limit. Its scan stops at `step < 256` as in the GLSL, so each
   entry sums a window of 256 invocations rather than a full prefix. That is kept so
@@ -101,7 +103,9 @@ Each shader lists its differences at the top. In short:
 
 ## Tools
 
-* `pyrowave-webgpu-encode <in.y4m> <out.pyrowave> <bytes_per_frame> [--frames N] [--timestamps] [--transfer-bench] [--gpu-input | --nv12]`
+* `pyrowave-webgpu-encode <in.y4m> <out.pyrowave> <bytes_per_frame> [--frames N] [--timestamps] [--transfer-bench] [--gpu-input | --nv12]`.
+  `--gpu-input` and `--nv12` exercise the GPU and NV12 entry points; the bitstream is
+  the same byte for byte.
 * `pyrowave-webgpu-decode <in.pyrowave> <out.y4m> [--timestamps]`
 * `pyrowave-vulkan-cli encode|decode ...`: the same through the Vulkan C API, built
   with `PYROWAVE_WEBGPU=ON` from the top level.
@@ -150,16 +154,18 @@ memory, mean over 89 frames:
 
 | | Vulkan (C API) | WebGPU (wgpu-native) |
 |---|---|---|
-| encode, wall clock, upload to packets | 0.74 ms | 0.63 ms |
-| encode, GPU: DWT / quant / analyze / resolve / packing | 0.023 / 0.047 / 0.016 / 0.005 / 0.022 ms | 0.081 / 0.053 / 0.015 / 0.005 / 0.034 ms |
-| decode, wall clock, packets to planes | 0.51 ms | 0.50 ms |
-| decode, GPU: dequant / iDWT | 0.032 / 0.024 ms | 0.055 / 0.051 ms |
+| encode, wall clock, upload to packets | 0.77 ms | 0.62 ms |
+| encode, GPU: DWT / quant / analyze / resolve / packing | 0.023 / 0.047 / 0.016 / 0.005 / 0.022 ms | 0.055 / 0.053 / 0.016 / 0.005 / 0.034 ms |
+| decode, wall clock, packets to planes | 0.54 ms | 0.48 ms |
+| decode, GPU: dequant / iDWT | 0.032 / 0.024 ms | 0.055 / 0.034 ms |
 
 Uploading one 4:2:0 frame on its own takes 0.12 ms and reading back 250000 bytes
-0.18 ms (round trips, wall clock), so at this size moving frames through CPU memory
-costs more than the GPU work. The remaining GPU gap is mostly the transforms: they
-still run one dispatch per component and level, with barriers between them, and the
-pyramid is twice the size of the Vulkan build's R16F levels.
+0.19 ms (round trips, wall clock), so at this size moving frames through CPU memory
+costs more than the GPU work. The wall clock totals favour WebGPU only because the
+Vulkan C API's CPU path creates its input images every frame. The GPU gap that is
+left is the barriers WebGPU still needs between the remaining dispatches (7 for the
+DWT at 4:2:0, 5 for dequant) where the Vulkan build has none within a level, and the
+`r32float` pyramid, twice the size of the Vulkan build's R16F levels.
 
 ## Notes for a WASM build
 
