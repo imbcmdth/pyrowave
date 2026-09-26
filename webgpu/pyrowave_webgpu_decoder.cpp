@@ -10,6 +10,7 @@
 
 #include "pyrowave_webgpu_common.hpp"
 #include <algorithm>
+#include <stdlib.h>
 #include <new>
 
 using namespace PyroWave;
