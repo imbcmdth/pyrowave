@@ -28,6 +28,7 @@ struct DWTRegisters
 	uint32_t store_fp16;
 	uint32_t padding;
 };
+static_assert(sizeof(DWTRegisters) == 32, "Must match Registers in the WGSL.");
 
 struct QuantizerRegisters
 {
@@ -44,6 +45,7 @@ struct QuantizerRegisters
 	int32_t texture_level;
 	uint32_t padding[3];
 };
+static_assert(sizeof(QuantizerRegisters) == 64, "Must match Registers in the WGSL.");
 
 struct AnalyzeRegisters
 {
@@ -58,6 +60,7 @@ struct AnalyzeRegisters
 	uint32_t block_index_shamt;
 	uint32_t padding;
 };
+static_assert(sizeof(AnalyzeRegisters) == 48, "Must match Registers in the WGSL.");
 
 struct ResolveRegisters
 {
@@ -65,6 +68,7 @@ struct ResolveRegisters
 	uint32_t num_blocks_per_subdivision;
 	uint32_t padding[2];
 };
+static_assert(sizeof(ResolveRegisters) == 16, "Must match Registers in the WGSL.");
 
 struct BlockPackingRegisters
 {
@@ -79,6 +83,7 @@ struct BlockPackingRegisters
 	int32_t block_stride_8x8;
 	uint32_t padding[4];
 };
+static_assert(sizeof(BlockPackingRegisters) == 64, "Must match Registers in the WGSL.");
 
 enum Stage
 {

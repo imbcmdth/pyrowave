@@ -26,6 +26,7 @@ struct DequantRegisters
 	uint32_t store_fp16;
 	uint32_t padding[2];
 };
+static_assert(sizeof(DequantRegisters) == 32, "Must match Registers in the WGSL.");
 
 struct IDWTRegisters
 {
@@ -34,8 +35,10 @@ struct IDWTRegisters
 	uint32_t store_fp16;
 	uint32_t output_offset;
 	uint32_t output_stride;
-	uint32_t padding;
+	uint32_t output_rows;
+	uint32_t padding[4];
 };
+static_assert(sizeof(IDWTRegisters) == 48, "Must match Registers in the WGSL.");
 
 enum Stage
 {
@@ -197,6 +200,7 @@ bool pyrowave_webgpu_decoder_opaque::plan_idwt(uint32_t &slot)
 			{
 				component_regs.output_offset = plane_offset[c];
 				component_regs.output_stride = plane_stride[c];
+				component_regs.output_rows = uint32_t(aligned_plane_height(c));
 				write_uniform(uniform_data, slot, component_regs);
 
 				const BindingResource resources[] = {

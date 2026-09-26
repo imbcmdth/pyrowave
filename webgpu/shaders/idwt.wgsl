@@ -16,10 +16,15 @@ struct Registers
     resolution: vec2<i32>,
     inv_resolution: vec2<f32>,
     store_fp16: u32,
-    // main_final only, in u32 words.
+    // main_final only, in u32 words and rows. The last tile can hang over the edge of
+    // the plane, which image stores in the GLSL drop silently.
     output_offset: u32,
     output_stride: u32,
-    padding: u32,
+    output_rows: u32,
+    padding0: u32,
+    padding1: u32,
+    padding2: u32,
+    padding3: u32,
 };
 
 @group(0) @binding(0) var<uniform> registers: Registers;
@@ -242,7 +247,10 @@ fn main_final(@builtin(local_invocation_index) local_invocation_index: u32,
 
         let row = u32(BLOCK_SIZE * workgroup_id.x + x);
         let word = u32(BLOCK_SIZE / 4 * workgroup_id.y + m);
-        uOutputPlane[registers.output_offset + row * registers.output_stride + word] =
-            pack4x8unorm(vec4<f32>(a.x, a.y, b.x, b.y));
+        if (row < registers.output_rows && word < registers.output_stride)
+        {
+            uOutputPlane[registers.output_offset + row * registers.output_stride + word] =
+                pack4x8unorm(vec4<f32>(a.x, a.y, b.x, b.y));
+        }
     }
 }
