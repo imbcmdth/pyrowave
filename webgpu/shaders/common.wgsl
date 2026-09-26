@@ -58,21 +58,22 @@ fn extract_u16(word: u32, half_index: u32) -> u32
     return extractBits(word, 16u * (half_index & 1u), 16u);
 }
 
-// Rounds to the nearest FP16 value, keeping FP16 denormals. Not
-// unpack2x16float(pack2x16float(x)): at least one driver folds that round trip away.
-// quantizeToF16 flushes FP16 denormals to zero, so those are rounded by hand.
-fn round_to_f16(v: f32) -> f32
-{
-    if (abs(v) < 6.103515625e-05)
-    {
-        return round(v * 16777216.0) * (1.0 / 16777216.0);
-    }
-    return quantizeToF16(v);
-}
-
+// Rounds to the nearest FP16 value (ties to even), keeping FP16 denormals, as a
+// conversion to FP16 and back would. Done with integer math because
+// unpack2x16float(pack2x16float(x)) can be folded away by the driver, and
+// quantizeToF16 flushes FP16 denormals and was measurably slower.
+// Values beyond the FP16 range are not handled; wavelet coefficients stay far below.
 fn round_to_f16_vec4(v: vec4<f32>) -> vec4<f32>
 {
-    return vec4<f32>(round_to_f16(v.x), round_to_f16(v.y), round_to_f16(v.z), round_to_f16(v.w));
+    let bits = bitcast<vec4<u32>>(v);
+    let normal = bitcast<vec4<f32>>((bits + 0xfffu + ((bits >> vec4<u32>(13u)) & vec4<u32>(1u))) & vec4<u32>(0xffffe000u));
+    let denormal = round(v * 16777216.0) * (1.0 / 16777216.0);
+    return select(normal, denormal, abs(v) < vec4<f32>(6.103515625e-05));
+}
+
+fn round_to_f16(v: f32) -> f32
+{
+    return round_to_f16_vec4(vec4<f32>(v)).x;
 }
 
 // The wavelet pyramid is always an r32float texture, since that is the only single
