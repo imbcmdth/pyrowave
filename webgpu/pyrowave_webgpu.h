@@ -350,6 +350,22 @@ pyrowave_webgpu_decoder_decode_read(pyrowave_webgpu_decoder decoder, const pyrow
 PYROWAVE_WEBGPU_PUBLIC_API pyrowave_webgpu_result
 pyrowave_webgpu_decoder_decode_cpu(pyrowave_webgpu_decoder decoder, const pyrowave_webgpu_cpu_buffer *output);
 
+// GPU output: one r8unorm 2D texture per plane, created with WGPUTextureUsage_CopyDst,
+// at the plane's size: width x height for plane 0, and for planes 1 and 2
+// (width / 2) x (height / 2) for 420 chroma or width x height for 444. Only mip 0
+// and layer 0 are written.
+typedef struct pyrowave_webgpu_gpu_output
+{
+	WGPUTexture planes[3];
+} pyrowave_webgpu_gpu_output;
+
+// Submits the decode of the queued packets with the planes copied into `output` on
+// the device, and returns without waiting. Nothing is read back: work submitted to
+// the device's queue afterwards sees the planes. decode_read does not apply to a
+// frame decoded this way; get_timings does.
+PYROWAVE_WEBGPU_PUBLIC_API pyrowave_webgpu_result
+pyrowave_webgpu_decoder_decode_gpu(pyrowave_webgpu_decoder decoder, const pyrowave_webgpu_gpu_output *output);
+
 PYROWAVE_WEBGPU_PUBLIC_API pyrowave_webgpu_result
 pyrowave_webgpu_decoder_get_timings(pyrowave_webgpu_decoder decoder, pyrowave_webgpu_timings *timings);
 

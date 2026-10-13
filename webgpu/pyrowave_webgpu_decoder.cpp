@@ -5,8 +5,9 @@
 // pyrowave_decoder.cpp: dequant -> iDWT. Packet parsing is the shared, API free
 // BitstreamParser.
 //
-// The decoded planes land in one storage buffer of packed 8-bit samples, with rows
-// padded to the aligned size, and are read back from there.
+// The decoded planes land in one storage buffer of packed 8-bit samples, and are read
+// back from there or copied into textures. Each row is padded to 256 bytes and each
+// plane starts on a 512 byte boundary, which a buffer to texture copy needs.
 
 #include "pyrowave_webgpu_common.hpp"
 #include <algorithm>
@@ -79,9 +80,12 @@ struct pyrowave_webgpu_decoder_opaque
 	Readback readback;
 	uint64_t readback_timestamp_offset = 0;
 	bool has_frame = false;
+	// Whether the last frame's planes were read back, rather than copied into textures.
+	bool planes_read_back = false;
 
 	bool init(pyrowave_webgpu_device device, int width, int height, ChromaSubsampling chroma);
 	void release();
+	pyrowave_webgpu_result submit(const WGPUTexture *planes);
 	bool plan_idwt();
 	bool plan_dequant();
 	bool rebuild_dequant_groups();
@@ -292,11 +296,13 @@ bool pyrowave_webgpu_decoder_opaque::init(pyrowave_webgpu_device device_, int wi
 	if (!payload_buffer)
 		return false;
 
+	// In words: rows of 256 bytes, planes on 512 byte boundaries.
 	uint32_t offset = 0;
 	for (int plane = 0; plane < NumComponents; plane++)
 	{
+		offset = (offset + 127) & ~127u;
 		plane_offset[plane] = offset;
-		plane_stride[plane] = uint32_t(aligned_plane_width(plane)) / 4;
+		plane_stride[plane] = ((uint32_t(aligned_plane_width(plane)) + 255) & ~255u) / 4;
 		offset += plane_stride[plane] * uint32_t(aligned_plane_height(plane));
 	}
 	output_size = uint64_t(offset) * sizeof(uint32_t);
@@ -409,13 +415,32 @@ pyrowave_webgpu_result pyrowave_webgpu_decoder_decode_submit(pyrowave_webgpu_dec
 {
 	if (!decoder)
 		return PYROWAVE_WEBGPU_ERROR_INVALID_ARGUMENT;
+	return decoder->submit(nullptr);
+}
 
-	auto *device = decoder->device;
+pyrowave_webgpu_result pyrowave_webgpu_decoder_decode_gpu(pyrowave_webgpu_decoder decoder,
+                                                          const pyrowave_webgpu_gpu_output *output)
+{
+	if (!decoder || !output)
+		return PYROWAVE_WEBGPU_ERROR_INVALID_ARGUMENT;
+	for (auto *plane : output->planes)
+		if (!plane)
+			return PYROWAVE_WEBGPU_ERROR_INVALID_ARGUMENT;
+	return decoder->submit(output->planes);
+}
+
+// Records and submits the decode of the queued packets. With `planes`, the planes are
+// copied into those textures and only the timestamps, if any, are read back; without,
+// the planes are read back.
+pyrowave_webgpu_result pyrowave_webgpu_decoder_opaque::submit(const WGPUTexture *planes)
+{
+	auto *decoder = this;
 
 	// The readback buffer is reused; the previous frame must be off the CPU first.
 	if (decoder->readback.pending)
 		decoder->readback.wait(device);
 	decoder->readback.unmap();
+	decoder->readback.completed = false;
 	decoder->has_frame = false;
 
 	const auto &offsets = decoder->parser.dequant_offsets();
@@ -451,7 +476,23 @@ pyrowave_webgpu_result pyrowave_webgpu_decoder_decode_submit(pyrowave_webgpu_dec
 		wgpuComputePassEncoderRelease(pass);
 	}
 
-	wgpuCommandEncoderCopyBufferToBuffer(cmd, decoder->output_buffer, 0, decoder->readback.buffer, 0, decoder->output_size);
+	if (planes)
+	{
+		for (int plane = 0; plane < NumComponents; plane++)
+		{
+			WGPUTexelCopyBufferInfo src = WGPU_TEXEL_COPY_BUFFER_INFO_INIT;
+			src.buffer = decoder->output_buffer;
+			src.layout.offset = uint64_t(decoder->plane_offset[plane]) * sizeof(uint32_t);
+			src.layout.bytesPerRow = decoder->plane_stride[plane] * uint32_t(sizeof(uint32_t));
+			src.layout.rowsPerImage = uint32_t(decoder->aligned_plane_height(plane));
+			WGPUTexelCopyTextureInfo dst = WGPU_TEXEL_COPY_TEXTURE_INFO_INIT;
+			dst.texture = planes[plane];
+			WGPUExtent3D extent = { uint32_t(decoder->plane_width(plane)), uint32_t(decoder->plane_height(plane)), 1 };
+			wgpuCommandEncoderCopyBufferToTexture(cmd, &src, &dst, &extent);
+		}
+	}
+	else
+		wgpuCommandEncoderCopyBufferToBuffer(cmd, decoder->output_buffer, 0, decoder->readback.buffer, 0, decoder->output_size);
 	decoder->timer.resolve(cmd, decoder->readback.buffer, decoder->readback_timestamp_offset);
 
 	WGPUCommandBuffer cmd_buffer = wgpuCommandEncoderFinish(cmd, nullptr);
@@ -459,11 +500,14 @@ pyrowave_webgpu_result pyrowave_webgpu_decoder_decode_submit(pyrowave_webgpu_dec
 	wgpuCommandBufferRelease(cmd_buffer);
 	wgpuCommandEncoderRelease(cmd);
 
-	decoder->readback.map_async(device);
+	// Textures need nothing read back but the timestamps, where there are any.
+	if (!planes || decoder->timer.readback_size())
+		decoder->readback.map_async(device);
 	if (const char *dump = getenv("PYROWAVE_WEBGPU_DUMP_PYRAMID"))
 		decoder->pyramid.dump(device, decoder->layout, dump);
 	decoder->parser.mark_frame_decoded();
 	decoder->has_frame = true;
+	decoder->planes_read_back = !planes;
 	return PYROWAVE_WEBGPU_SUCCESS;
 }
 
@@ -479,13 +523,15 @@ pyrowave_webgpu_result pyrowave_webgpu_decoder_decode_poll(pyrowave_webgpu_decod
 
 	if (decoder->readback.pending)
 		return PYROWAVE_WEBGPU_NOT_READY;
+	if (!decoder->planes_read_back && !decoder->readback.completed)
+		return PYROWAVE_WEBGPU_SUCCESS;
 	return decoder->readback.mapped ? PYROWAVE_WEBGPU_SUCCESS : PYROWAVE_WEBGPU_ERROR_GENERIC;
 }
 
 pyrowave_webgpu_result pyrowave_webgpu_decoder_decode_read(pyrowave_webgpu_decoder decoder,
                                                            const pyrowave_webgpu_cpu_buffer *output)
 {
-	if (!decoder || !output || !decoder->has_frame)
+	if (!decoder || !output || !decoder->has_frame || !decoder->planes_read_back)
 		return PYROWAVE_WEBGPU_ERROR_INVALID_ARGUMENT;
 
 	const auto &layout = decoder->layout;
@@ -535,7 +581,15 @@ pyrowave_webgpu_result pyrowave_webgpu_decoder_decode_cpu(pyrowave_webgpu_decode
 pyrowave_webgpu_result pyrowave_webgpu_decoder_get_timings(pyrowave_webgpu_decoder decoder,
                                                            pyrowave_webgpu_timings *timings)
 {
-	if (!decoder || !timings || !decoder->has_frame || !decoder->readback.wait(decoder->device))
+	if (!decoder || !timings || !decoder->has_frame)
+		return PYROWAVE_WEBGPU_ERROR_INVALID_ARGUMENT;
+	// A frame decoded into textures with no timestamps has nothing to read.
+	if (!decoder->planes_read_back && !decoder->timer.readback_size())
+	{
+		decoder->timer.read(nullptr, timings);
+		return PYROWAVE_WEBGPU_SUCCESS;
+	}
+	if (!decoder->readback.wait(decoder->device))
 		return PYROWAVE_WEBGPU_ERROR_INVALID_ARGUMENT;
 	decoder->timer.read(static_cast<const uint8_t *>(decoder->readback.data) + decoder->readback_timestamp_offset,
 	                    timings);

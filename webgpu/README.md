@@ -179,5 +179,10 @@ DWT at 4:2:0, 5 for dequant) where the Vulkan build has none within a level, and
   queries and `decode_read` wait if it has not landed.
 * Readback uses `wgpuBufferMapAsync` and `wgpuBufferGetConstMappedRange`, once per
   frame, about 260 KB for the encoder at this rate and 3 MB for a 1080p decode.
+* A host holding its pictures on the same device reads and writes no planes in host
+  memory: `pyrowave_webgpu_encoder_encode_gpu()` samples three single-channel textures,
+  and `pyrowave_webgpu_decoder_decode_gpu()` copies the decoded planes into three
+  `r8unorm` textures on the device. The decoder's planes buffer pads each row to 256
+  bytes and starts each plane on a 512-byte boundary so the copy needs no repacking.
 * If the WGSL front end rejects `enable subgroups;`, as naga does, the shaders are
   compiled again without it.
